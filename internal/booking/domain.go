@@ -7,10 +7,12 @@ import (
 )
 
 var (
-	ErrSeatTaken = errors.New("seat taken")
+	ErrSeatTaken        = errors.New("seat already taken")
+	ErrSessionNotFound  = errors.New("session not found")
+	ErrSessionExpired   = errors.New("session expired")
+	ErrUnauthorized     = errors.New("unauthorized")
 )
 
-// Booking represents a confirmed seat reservation.
 type Booking struct {
 	ID        string
 	MovieID   string
@@ -21,8 +23,8 @@ type Booking struct {
 }
 
 type BookingStore interface {
-	Book(b Booking) (Booking, error)
-	ListBookings(movieID string) []Booking
+	Book(ctx context.Context, b Booking) (Booking, error)
+	ListBookings(ctx context.Context, movieID string) ([]Booking, error)
 	Release(ctx context.Context, sessionID string, userID string) error
 	Confirm(ctx context.Context, sessionID string, userID string) (Booking, error)
 }

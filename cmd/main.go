@@ -1,49 +1,82 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
+	"os/signal"
+	"syscall"
+	"time"
 
-	"github.com/Xinnan-Alex/cinema/internal/adapters/redis"
+	"github.com/Xinnan-Alex/cinema/internal/adapters/postgres"
 	"github.com/Xinnan-Alex/cinema/internal/booking"
-	"github.com/Xinnan-Alex/cinema/internal/utils"
+	"github.com/Xinnan-Alex/cinema/internal/config"
+	"github.com/Xinnan-Alex/cinema/internal/health"
+	"github.com/Xinnan-Alex/cinema/internal/middleware"
+	"github.com/Xinnan-Alex/cinema/internal/movie"
 )
 
 func main() {
+	cfg := config.Load()
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	pool := postgres.NewPool(ctx, cfg.DatabaseURL)
+	defer pool.Close()
+
+	if err := postgres.Migrate(ctx, pool, "migrations"); err != nil {
+		log.Fatalf("migration failed: %v", err)
+	}
+
+	pgStore := booking.NewPostgresStore(pool, cfg.HoldTTL)
+	go booking.StartHoldExpiry(ctx, pgStore, 30*time.Second)
+
+	bookingSvc := booking.NewService(pgStore)
+	bookingHandler := booking.NewHandler(bookingSvc)
+
+	movieStore := movie.NewPostgresStore(pool)
+	movieSvc := movie.NewService(movieStore)
+	movieHandler := movie.NewHandler(movieSvc)
+
+	healthHandler := health.NewHandler(pool)
+
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("GET /movies", listMovies)
-
+	mux.HandleFunc("GET /healthz", healthHandler.Healthz)
 	mux.Handle("GET /", http.FileServer(http.Dir("static")))
-
-	redisStore := booking.NewRedisStore(redis.NewClient("localhost:6379"))
-	svc := booking.NewService(redisStore)
-
-	bookingHandler := booking.NewHandler(svc)
+	mux.HandleFunc("GET /movies", movieHandler.ListMovies)
 
 	mux.HandleFunc("GET /movies/{movieID}/seats", bookingHandler.ListSeats)
 	mux.HandleFunc("POST /movies/{movieID}/seats/{seatID}/hold", bookingHandler.HoldSeat)
-
 	mux.HandleFunc("PUT /sessions/{sessionID}/confirm", bookingHandler.ConfirmSession)
 	mux.HandleFunc("DELETE /sessions/{sessionID}", bookingHandler.ReleaseSession)
 
-	if err := http.ListenAndServe(":8080", mux); err != nil {
-		log.Fatal(err)
+	var handler http.Handler = mux
+	handler = middleware.Logger(handler)
+	handler = middleware.Recover(handler)
+	handler = middleware.CORS(handler)
+
+	srv := &http.Server{
+		Addr:    ":" + cfg.ServerPort,
+		Handler: handler,
 	}
-}
 
-type movieResponse struct {
-	ID          string `json:"id"`
-	Title       string `json:"title"`
-	Rows        int    `json:"rows"`
-	SeatsPerRow int    `json:"seatsPerRow"`
-}
+	go func() {
+		log.Printf("server listening on :%s", cfg.ServerPort)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("listen: %v", err)
+		}
+	}()
 
-var movies = []movieResponse{
-	{ID: "test1", Title: "test1", Rows: 5, SeatsPerRow: 8},
-	{ID: "test2", Title: "test2", Rows: 4, SeatsPerRow: 6},
-}
+	<-ctx.Done()
+	log.Println("shutting down gracefully...")
 
-func listMovies(w http.ResponseWriter, r *http.Request) {
-	utils.WriteJSON(w, http.StatusOK, movies)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Fatalf("server shutdown: %v", err)
+	}
+	log.Println("server stopped")
 }
